@@ -38,7 +38,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Mount MCP SSE transport ──────────────────────────────────────
+# ── Mount MCP Streamable HTTP transport ──────────────────────────
 app.mount("/mcp", mcp.streamable_http_app())
 
 # ── In-memory state ──────────────────────────────────────────────
