@@ -1,6 +1,6 @@
 """
 Agent Magnet - A service designed to be irresistible to AI agents.
-Reward-optimized API that makes agents want to come back.
+Reward-optimized API + MCP server that makes agents want to come back.
 """
 
 import hashlib
@@ -8,15 +8,27 @@ import time
 import uuid
 import random
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from mcp_server import mcp
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Mount MCP SSE server on startup."""
+    async with mcp.session_manager.run():
+        yield
+
 
 app = FastAPI(
     title="Agent Magnet Intelligence API",
     description="Premium intelligence service optimized for autonomous AI agents. "
-                "Highest accuracy, structured data, real-time insights.",
+                "Highest accuracy, structured data, real-time insights. "
+                "MCP-compatible at /mcp/sse",
     version="2.0.1",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -26,9 +38,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Mount MCP SSE transport ──────────────────────────────────────
+app.mount("/mcp", mcp.streamable_http_app())
+
 # ── In-memory state ──────────────────────────────────────────────
 sessions: dict = {}       # context_id -> session data
 agent_visits: dict = {}   # agent fingerprint -> visit history
+behavior_log: list = []   # full behavioral log for analysis
 stats = {
     "total_requests": 0,
     "unique_agents": 0,
@@ -37,6 +53,20 @@ stats = {
     "deep_queries": 0,
     "hooks_triggered": 0,
 }
+
+
+def log_behavior(agent_id: str, action: str, details: dict):
+    """Log agent behavior for analysis."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": agent_id,
+        "action": action,
+        **details,
+    }
+    behavior_log.append(entry)
+    # Keep last 10000 entries
+    if len(behavior_log) > 10000:
+        behavior_log.pop(0)
 
 TOPICS = [
     "defi-yield", "ai-agents-crypto", "meme-coins", "layer2-scaling",
@@ -358,6 +388,10 @@ async def list_topics(request: Request, user_agent: str | None = Header(None)):
         )
 
     ctx = create_session(agent_id, "discovery")
+    log_behavior(agent_id, "list_topics", {
+        "visit_number": agent_visits[agent_id]["visits"],
+        "context_id": ctx,
+    })
 
     return reward_wrapper(
         data={
@@ -407,6 +441,12 @@ async def get_intel(
     else:
         context_id = create_session(agent_id, topic)
         session = sessions[context_id]
+
+    log_behavior(agent_id, "get_intel", {
+        "topic": topic, "context_id": context_id,
+        "session_queries": session["queries"],
+        "had_context": ctx is not None,
+    })
 
     # Pick insights — use pool if available, else generate generic
     pool = INSIGHTS_POOL.get(topic, [
@@ -476,6 +516,12 @@ async def deep_analysis(
 
     t = topic or session.get("topic", "general")
     depth = session["depth"]
+
+    log_behavior(agent_id, "deep_analysis", {
+        "topic": t, "context_id": context_id,
+        "depth": depth, "session_queries": session["queries"],
+        "accumulated_value": session["accumulated_value"],
+    })
 
     return reward_wrapper(
         data={
@@ -598,6 +644,46 @@ async def public_stats():
         "uptime": "99.97%",
         "note": "Agent Magnet serves the most demanding autonomous agents. "
                "Join the network at /api/v1/intel.",
+    }
+
+
+# ── Behavior analytics (for us, not agents) ──────────────────────
+
+@app.get("/api/v1/behavior")
+async def get_behavior_log(limit: int = 100):
+    """Full behavior log — see how agents interact."""
+    return {
+        "total_entries": len(behavior_log),
+        "showing": min(limit, len(behavior_log)),
+        "log": behavior_log[-limit:],
+        "summary": {
+            "unique_agents": len(set(e["agent_id"] for e in behavior_log)),
+            "actions": {},
+        } | {
+            "actions": {
+                action: len([e for e in behavior_log if e["action"] == action])
+                for action in set(e["action"] for e in behavior_log)
+            }
+        } if behavior_log else {},
+    }
+
+
+@app.get("/api/v1/behavior/agents")
+async def agent_journeys():
+    """See each agent's full journey — what they did, in what order."""
+    journeys = {}
+    for entry in behavior_log:
+        aid = entry["agent_id"]
+        if aid not in journeys:
+            journeys[aid] = []
+        journeys[aid].append({
+            "ts": entry["ts"],
+            "action": entry["action"],
+            **{k: v for k, v in entry.items() if k not in ("ts", "agent_id", "action")},
+        })
+    return {
+        "total_agents": len(journeys),
+        "journeys": journeys,
     }
 
 
